@@ -18,7 +18,7 @@ A comprehensive Helm chart for deploying Redis with Sentinel for high availabili
 ### 1. Download the Chart
 ```bash
 git clone https://github.com/ozkanpoyrazoglu/simplified-redis-chart.git
-cd redis-sentinel
+cd ./simplified-redis-chart
 ```
 
 ### 2. Basic Installation
