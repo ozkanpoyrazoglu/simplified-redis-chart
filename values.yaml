@@ -1,0 +1,150 @@
+# Global configurations
+global:
+  imageRegistry: ""
+  storageClass: ""
+
+# Redis configuration
+redis:
+  image:
+    registry: docker.io
+    repository: redis
+    tag: "7.2-alpine"
+    pullPolicy: IfNotPresent
+  
+  # Redis master configuration
+  master:
+    replicas: 1
+    
+  # Redis replica configuration  
+  replica:
+    enabled: true
+    replicas: 2
+    
+  # Authentication
+  auth:
+    enabled: true
+    password: "redis-password-123"
+    # ACL users configuration
+    acl:
+      enabled: true
+      users:
+        - username: "admin"
+          password: "admin-password-123"
+          permissions: "+@all"
+        - username: "readonly"
+          password: "readonly-password-123"
+          permissions: "+@read"
+        - username: "app-user"
+          password: "app-password-123"
+          permissions: "+@all -@dangerous"
+  
+  # Redis configuration parameters
+  configuration: |
+    # Redis configuration
+    maxmemory 256mb
+    maxmemory-policy allkeys-lru
+    save 900 1
+    save 300 10
+    save 60 10000
+    
+  # Persistence
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: 8Gi
+    accessModes:
+      - ReadWriteOnce
+  
+  # Resources
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+# Sentinel configuration
+sentinel:
+  image:
+    registry: docker.io
+    repository: redis
+    tag: "7.2-alpine"
+    pullPolicy: IfNotPresent
+    
+  replicas: 3
+  
+  # Sentinel configuration - hostname will be templated in configmap
+  configuration: |
+    # Additional sentinel configuration
+    # Monitor configuration is handled in configmap template
+    
+  # Resources
+  resources:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+# Service configurations
+service:
+  redis:
+    type: ClusterIP
+    port: 6379
+    annotations: {}
+    
+  sentinel:
+    type: ClusterIP
+    port: 26379
+    annotations: {}
+
+# ServiceAccount
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# Pod Security Context
+podSecurityContext:
+  fsGroup: 999
+  runAsUser: 999
+  runAsGroup: 999
+
+# Security Context
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 999
+
+# Node selector, tolerations and affinity
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Pod disruption budget
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Monitoring
+metrics:
+  enabled: false
+  image:
+    registry: docker.io
+    repository: oliver006/redis_exporter
+    tag: v1.45.0
+    pullPolicy: IfNotPresent
+  port: 9121
+  resources:
+    limits:
+      cpu: 100m
+      memory: 64Mi
+    requests:
+      cpu: 10m
+      memory: 32Mi

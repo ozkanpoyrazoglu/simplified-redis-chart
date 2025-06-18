@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "redis-sentinel.fullname" . }}-sentinel
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sentinel
+spec:
+  serviceName: {{ include "redis-sentinel.fullname" . }}-sentinel
+  replicas: {{ .Values.sentinel.replicas }}
+  selector:
+    matchLabels:
+      {{- include "redis-sentinel.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: sentinel
+  template:
+    metadata:
+      labels:
+        {{- include "redis-sentinel.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: sentinel
+    spec:
+      serviceAccountName: {{ include "redis-sentinel.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+      - name: config-init
+        image: {{ include "redis-sentinel.sentinel.image" . }}
+        command:
+        - sh
+        - -c
+        - |
+          cp /opt/sentinel-readonly/sentinel.conf /data/sentinel.conf
+          chmod 666 /data/sentinel.conf
+        volumeMounts:
+        - name: sentinel-config-readonly
+          mountPath: /opt/sentinel-readonly
+        - name: sentinel-data
+          mountPath: /data
+        securityContext:
+          runAsUser: 999
+      containers:
+      - name: sentinel
+        image: {{ include "redis-sentinel.sentinel.image" . }}
+        imagePullPolicy: {{ .Values.sentinel.image.pullPolicy }}
+        securityContext:
+          {{- toYaml .Values.securityContext | nindent 10 }}
+        ports:
+        - containerPort: 26379
+          name: sentinel
+        command:
+        - redis-sentinel
+        - /data/sentinel.conf
+        volumeMounts:
+        - name: sentinel-config-readonly
+          mountPath: /opt/sentinel-readonly
+        - name: sentinel-data
+          mountPath: /data
+        - name: tmp
+          mountPath: /tmp
+        resources:
+          {{- toYaml .Values.sentinel.resources | nindent 10 }}
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - -p
+            - "26379"
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - -p
+            - "26379"
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: sentinel-config-readonly
+        configMap:
+          name: {{ include "redis-sentinel.fullname" . }}-sentinel-config
+      - name: sentinel-data
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "redis-sentinel.fullname" . }}-sentinel
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sentinel
+  {{- with .Values.service.sentinel.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.sentinel.type }}
+  ports:
+  - port: {{ .Values.service.sentinel.port }}
+    targetPort: sentinel
+    protocol: TCP
+    name: sentinel
+  selector:
+    {{- include "redis-sentinel.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: sentinel

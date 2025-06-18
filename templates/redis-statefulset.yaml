@@ -1,0 +1,244 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "redis-sentinel.fullname" . }}-redis-master
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis-master
+spec:
+  serviceName: {{ include "redis-sentinel.fullname" . }}-redis-master
+  replicas: {{ .Values.redis.master.replicas }}
+  selector:
+    matchLabels:
+      {{- include "redis-sentinel.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: redis-master
+  template:
+    metadata:
+      labels:
+        {{- include "redis-sentinel.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: redis-master
+    spec:
+      serviceAccountName: {{ include "redis-sentinel.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+      - name: redis
+        image: {{ include "redis-sentinel.redis.image" . }}
+        imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+        securityContext:
+          {{- toYaml .Values.securityContext | nindent 10 }}
+        ports:
+        - containerPort: 6379
+          name: redis
+        command:
+        - redis-server
+        - /opt/redis/redis.conf
+        env:
+        {{- if .Values.redis.auth.enabled }}
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "redis-sentinel.fullname" . }}-auth
+              key: redis-password
+        {{- end }}
+        volumeMounts:
+        - name: redis-config
+          mountPath: /opt/redis
+        - name: redis-data
+          mountPath: /data
+        - name: tmp
+          mountPath: /tmp
+        resources:
+          {{- toYaml .Values.redis.resources | nindent 10 }}
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - --no-auth-warning
+            {{- if .Values.redis.auth.enabled }}
+            - -a
+            - $(REDIS_PASSWORD)
+            {{- end }}
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - --no-auth-warning
+            {{- if .Values.redis.auth.enabled }}
+            - -a
+            - $(REDIS_PASSWORD)
+            {{- end }}
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: redis-config
+        configMap:
+          name: {{ include "redis-sentinel.fullname" . }}-redis-config
+      - name: tmp
+        emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.redis.persistence.enabled }}
+  volumeClaimTemplates:
+  - metadata:
+      name: redis-data
+    spec:
+      accessModes:
+        {{- range .Values.redis.persistence.accessModes }}
+        - {{ . | quote }}
+        {{- end }}
+      {{- if .Values.redis.persistence.storageClass }}
+      {{- if (eq "-" .Values.redis.persistence.storageClass) }}
+      storageClassName: ""
+      {{- else }}
+      storageClassName: {{ .Values.redis.persistence.storageClass | quote }}
+      {{- end }}
+      {{- else if .Values.global.storageClass }}
+      storageClassName: {{ .Values.global.storageClass | quote }}
+      {{- end }}
+      resources:
+        requests:
+          storage: {{ .Values.redis.persistence.size | quote }}
+  {{- else }}
+      - name: redis-data
+        emptyDir: {}
+  {{- end }}
+---
+{{- if .Values.redis.replica.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "redis-sentinel.fullname" . }}-redis-replica
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis-replica
+spec:
+  serviceName: {{ include "redis-sentinel.fullname" . }}-redis-replica
+  replicas: {{ .Values.redis.replica.replicas }}
+  selector:
+    matchLabels:
+      {{- include "redis-sentinel.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: redis-replica
+  template:
+    metadata:
+      labels:
+        {{- include "redis-sentinel.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: redis-replica
+    spec:
+      serviceAccountName: {{ include "redis-sentinel.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+      - name: redis
+        image: {{ include "redis-sentinel.redis.image" . }}
+        imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+        securityContext:
+          {{- toYaml .Values.securityContext | nindent 10 }}
+        ports:
+        - containerPort: 6379
+          name: redis
+        command:
+        - redis-server
+        - /opt/redis/redis.conf
+        - --replicaof
+        - {{ include "redis-sentinel.fullname" . }}-redis-master.{{ .Release.Namespace }}.svc.cluster.local
+        - "6379"
+        env:
+        {{- if .Values.redis.auth.enabled }}
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "redis-sentinel.fullname" . }}-auth
+              key: redis-password
+        {{- end }}
+        volumeMounts:
+        - name: redis-config
+          mountPath: /opt/redis
+        - name: redis-data
+          mountPath: /data
+        - name: tmp
+          mountPath: /tmp
+        resources:
+          {{- toYaml .Values.redis.resources | nindent 10 }}
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - --no-auth-warning
+            {{- if .Values.redis.auth.enabled }}
+            - -a
+            - $(REDIS_PASSWORD)
+            {{- end }}
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - --no-auth-warning
+            {{- if .Values.redis.auth.enabled }}
+            - -a
+            - $(REDIS_PASSWORD)
+            {{- end }}
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: redis-config
+        configMap:
+          name: {{ include "redis-sentinel.fullname" . }}-redis-config
+      - name: tmp
+        emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.redis.persistence.enabled }}
+  volumeClaimTemplates:
+  - metadata:
+      name: redis-data
+    spec:
+      accessModes:
+        {{- range .Values.redis.persistence.accessModes }}
+        - {{ . | quote }}
+        {{- end }}
+      {{- if .Values.redis.persistence.storageClass }}
+      {{- if (eq "-" .Values.redis.persistence.storageClass) }}
+      storageClassName: ""
+      {{- else }}
+      storageClassName: {{ .Values.redis.persistence.storageClass | quote }}
+      {{- end }}
+      {{- else if .Values.global.storageClass }}
+      storageClassName: {{ .Values.global.storageClass | quote }}
+      {{- end }}
+      resources:
+        requests:
+          storage: {{ .Values.redis.persistence.size | quote }}
+  {{- else }}
+      - name: redis-data
+        emptyDir: {}
+  {{- end }}
+{{- end }}

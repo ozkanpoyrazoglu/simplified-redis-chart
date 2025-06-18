@@ -1,0 +1,18 @@
+apiVersion: v2
+name: redis-sentinel
+description: A Helm chart for Redis with Sentinel for high availability
+type: application
+version: 1.0.0
+appVersion: "7.2"
+keywords:
+  - redis
+  - sentinel
+  - database
+  - cache
+  - nosql
+home: https://redis.io
+sources:
+  - https://github.com/redis/redis
+maintainers:
+  - name: Your Name
+    email: your.email@example.com
