@@ -31,8 +31,9 @@ data:
     # Basic sentinel configuration
     port 26379
     
-    # Monitor the master
-    sentinel monitor mymaster {{ include "redis-sentinel.fullname" . }}-redis-master.{{ .Release.Namespace }}.svc.cluster.local 6379 2
+    # Monitor the master - using service name that resolves to cluster IP
+    sentinel resolve-hostnames yes
+    sentinel monitor mymaster redis-redis-sentinel-redis-master.redis.svc.cluster.local 6379 2
     sentinel down-after-milliseconds mymaster 5000
     sentinel parallel-syncs mymaster 1
     sentinel failover-timeout mymaster 10000
