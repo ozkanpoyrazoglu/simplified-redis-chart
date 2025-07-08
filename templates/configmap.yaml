@@ -33,7 +33,9 @@ data:
     
     # Monitor the master - using service name that resolves to cluster IP
     sentinel resolve-hostnames yes
-    sentinel monitor mymaster redis-redis-sentinel-redis-master.redis.svc.cluster.local 6379 2
+    # sentinel monitor mymaster redis-redis-sentinel-redis-master.redis.svc.cluster.local 6379 2
+    sentinel monitor mymaster {{ .Release.Namespace }}-{{ .Release.Name }}-redis-master.{{ .Release.Namespace }}.svc.cluster.local 6379 2
+
     sentinel down-after-milliseconds mymaster 5000
     sentinel parallel-syncs mymaster 1
     sentinel failover-timeout mymaster 10000
