@@ -24,7 +24,7 @@ data:
     {{- if eq .username "default" }}
     {{- fail "redis.auth.acl.users must not contain \"default\"; its password is redis.auth.password" }}
     {{- end }}
-    user {{ .username }} on >{{ .password }} {{ .keys | default "~*" }} {{ .channels | default "&*" }} {{ .permissions }}
+    user {{ .username }} on >{{ .password }} {{- with .keys }} {{ . }}{{ end }}{{- with .channels }} {{ . }}{{ end }} {{ .permissions }}
     {{- end }}
   {{- end }}
 ---

@@ -26,19 +26,25 @@ redis:
     password: "redis-password-123"
     # ACL users configuration
     # The "default" user is always created with redis.auth.password; do not list it here.
-    # Each user may set "keys" (default "~*") and "channels" (default "&*") patterns
-    # to restrict key and pub/sub channel access.
+    # "keys" and "channels" are Redis key (~pattern) and pub/sub channel (&pattern) rules.
+    # Nothing is added when they are omitted, and Redis then grants no key or channel access.
     acl:
       enabled: true
       users:
         - username: "admin"
           password: "admin-password-123"
+          keys: "~*"
+          channels: "&*"
           permissions: "+@all"
         - username: "readonly"
           password: "readonly-password-123"
+          keys: "~*"
+          channels: "&*"
           permissions: "+@read"
         - username: "app-user"
           password: "app-password-123"
+          keys: "~*"
+          channels: "&*"
           permissions: "+@all -@dangerous"
   
   # Redis configuration parameters

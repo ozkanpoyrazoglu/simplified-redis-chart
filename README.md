@@ -47,6 +47,7 @@ kubectl exec redis-sentinel-sentinel-0 -- redis-cli -p 26379 sentinel masters
 ### Authentication & ACL
 
 Configure Redis authentication and ACL users in `values.yaml`:
+Users have no key or channel access unless `keys` / `channels` patterns are set.
 
 ```yaml
 redis:
@@ -58,12 +59,16 @@ redis:
       users:
         - username: "admin"
           password: "admin-password"
+          keys: "~*"
+          channels: "&*"
           permissions: "+@all"
         - username: "readonly"
           password: "readonly-password"
+          keys: "~*"
           permissions: "+@read -@write"
         - username: "app-user"
           password: "app-password"
+          keys: "~app:*"
           permissions: "+@all -@dangerous -flushdb -flushall"
 ```
 
