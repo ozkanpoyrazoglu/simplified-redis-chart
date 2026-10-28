@@ -8,15 +8,23 @@ data:
   redis.conf: |
     {{- .Values.redis.configuration | nindent 4 }}
     {{- if .Values.redis.auth.enabled }}
+    {{- if .Values.redis.auth.acl.enabled }}
+    # default user password is defined in acl.conf (requirepass is ignored when aclfile is set)
+    aclfile /opt/redis/acl.conf
+    {{- else }}
     requirepass {{ .Values.redis.auth.password }}
     {{- end }}
-    {{- if and .Values.redis.auth.enabled .Values.redis.auth.acl.enabled }}
-    aclfile /opt/redis/acl.conf
+    # required by replicas, and by the master after it is demoted by a failover
+    masterauth {{ .Values.redis.auth.password }}
     {{- end }}
   {{- if and .Values.redis.auth.enabled .Values.redis.auth.acl.enabled }}
   acl.conf: |
+    user default on >{{ .Values.redis.auth.password }} ~* &* +@all
     {{- range .Values.redis.auth.acl.users }}
-    user {{ .username }} on >{{ .password }} {{ .permissions }}
+    {{- if eq .username "default" }}
+    {{- fail "redis.auth.acl.users must not contain \"default\"; its password is redis.auth.password" }}
+    {{- end }}
+    user {{ .username }} on >{{ .password }} {{ .keys | default "~*" }} {{ .channels | default "&*" }} {{ .permissions }}
     {{- end }}
   {{- end }}
 ---
@@ -30,18 +38,18 @@ data:
   sentinel.conf: |
     # Basic sentinel configuration
     port 26379
-    
+
     # Monitor the master - using service name that resolves to cluster IP
     sentinel resolve-hostnames yes
-    sentinel monitor mymaster redis-redis-sentinel-redis-master.redis.svc.cluster.local 6379 2
+    sentinel monitor mymaster {{ include "redis-sentinel.masterHost" . }} 6379 2
     sentinel down-after-milliseconds mymaster 5000
     sentinel parallel-syncs mymaster 1
     sentinel failover-timeout mymaster 10000
-    
+
     {{- if .Values.redis.auth.enabled }}
     sentinel auth-pass mymaster {{ .Values.redis.auth.password }}
     {{- end }}
-    
+
     # Additional configuration from values
     {{- if .Values.sentinel.configuration }}
     {{- .Values.sentinel.configuration | nindent 4 }}

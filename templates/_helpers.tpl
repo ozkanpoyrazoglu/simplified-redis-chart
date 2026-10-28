@@ -60,6 +60,13 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
+Redis master service FQDN
+*/}}
+{{- define "redis-sentinel.masterHost" -}}
+{{- printf "%s-redis-master.%s.svc.cluster.local" (include "redis-sentinel.fullname" .) .Release.Namespace -}}
+{{- end }}
+
+{{/*
 Redis image
 */}}
 {{- define "redis-sentinel.redis.image" -}}

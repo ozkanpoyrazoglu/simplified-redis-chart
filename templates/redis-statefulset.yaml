@@ -35,7 +35,8 @@ spec:
         - /opt/redis/redis.conf
         env:
         {{- if .Values.redis.auth.enabled }}
-        - name: REDIS_PASSWORD
+        # read automatically by redis-cli (used by probes)
+        - name: REDISCLI_AUTH
           valueFrom:
             secretKeyRef:
               name: {{ include "redis-sentinel.fullname" . }}-auth
@@ -53,25 +54,19 @@ spec:
         livenessProbe:
           exec:
             command:
-            - redis-cli
-            - --no-auth-warning
-            {{- if .Values.redis.auth.enabled }}
-            - -a
-            - $(REDIS_PASSWORD)
-            {{- end }}
-            - ping
+            - sh
+            - -c
+            # redis-cli exits 0 on error replies (e.g. NOAUTH), so check the reply
+            - redis-cli ping | grep -q PONG
           initialDelaySeconds: 30
           periodSeconds: 10
         readinessProbe:
           exec:
             command:
-            - redis-cli
-            - --no-auth-warning
-            {{- if .Values.redis.auth.enabled }}
-            - -a
-            - $(REDIS_PASSWORD)
-            {{- end }}
-            - ping
+            - sh
+            - -c
+            # redis-cli exits 0 on error replies (e.g. NOAUTH), so check the reply
+            - redis-cli ping | grep -q PONG
           initialDelaySeconds: 5
           periodSeconds: 5
       volumes:
@@ -80,6 +75,10 @@ spec:
           name: {{ include "redis-sentinel.fullname" . }}-redis-config
       - name: tmp
         emptyDir: {}
+      {{- if not .Values.redis.persistence.enabled }}
+      - name: redis-data
+        emptyDir: {}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -113,9 +112,6 @@ spec:
       resources:
         requests:
           storage: {{ .Values.redis.persistence.size | quote }}
-  {{- else }}
-      - name: redis-data
-        emptyDir: {}
   {{- end }}
 ---
 {{- if .Values.redis.replica.enabled }}
@@ -155,11 +151,12 @@ spec:
         - redis-server
         - /opt/redis/redis.conf
         - --replicaof
-        - {{ include "redis-sentinel.fullname" . }}-redis-master.{{ .Release.Namespace }}.svc.cluster.local
+        - {{ include "redis-sentinel.masterHost" . }}
         - "6379"
         env:
         {{- if .Values.redis.auth.enabled }}
-        - name: REDIS_PASSWORD
+        # read automatically by redis-cli (used by probes)
+        - name: REDISCLI_AUTH
           valueFrom:
             secretKeyRef:
               name: {{ include "redis-sentinel.fullname" . }}-auth
@@ -177,25 +174,19 @@ spec:
         livenessProbe:
           exec:
             command:
-            - redis-cli
-            - --no-auth-warning
-            {{- if .Values.redis.auth.enabled }}
-            - -a
-            - $(REDIS_PASSWORD)
-            {{- end }}
-            - ping
+            - sh
+            - -c
+            # redis-cli exits 0 on error replies (e.g. NOAUTH), so check the reply
+            - redis-cli ping | grep -q PONG
           initialDelaySeconds: 30
           periodSeconds: 10
         readinessProbe:
           exec:
             command:
-            - redis-cli
-            - --no-auth-warning
-            {{- if .Values.redis.auth.enabled }}
-            - -a
-            - $(REDIS_PASSWORD)
-            {{- end }}
-            - ping
+            - sh
+            - -c
+            # redis-cli exits 0 on error replies (e.g. NOAUTH), so check the reply
+            - redis-cli ping | grep -q PONG
           initialDelaySeconds: 5
           periodSeconds: 5
       volumes:
@@ -204,6 +195,10 @@ spec:
           name: {{ include "redis-sentinel.fullname" . }}-redis-config
       - name: tmp
         emptyDir: {}
+      {{- if not .Values.redis.persistence.enabled }}
+      - name: redis-data
+        emptyDir: {}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -237,8 +232,5 @@ spec:
       resources:
         requests:
           storage: {{ .Values.redis.persistence.size | quote }}
-  {{- else }}
-      - name: redis-data
-        emptyDir: {}
   {{- end }}
 {{- end }}

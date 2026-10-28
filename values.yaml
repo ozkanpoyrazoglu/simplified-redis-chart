@@ -25,6 +25,9 @@ redis:
     enabled: true
     password: "redis-password-123"
     # ACL users configuration
+    # The "default" user is always created with redis.auth.password; do not list it here.
+    # Each user may set "keys" (default "~*") and "channels" (default "&*") patterns
+    # to restrict key and pub/sub channel access.
     acl:
       enabled: true
       users:
