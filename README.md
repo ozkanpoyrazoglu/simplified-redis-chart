@@ -72,6 +72,7 @@ helm install redis-sentinel . --set redis.auth.password='<strong-password>'
 | `sentinel.replicas` | `3` | Number of Sentinels |
 | `sentinel.masterSet` / `sentinel.quorum` | `mymaster` / `2` | Sentinel master set name and quorum |
 | `sentinel.downAfterMilliseconds` / `failoverTimeout` / `parallelSyncs` | `5000` / `10000` / `1` | Sentinel failover tuning |
+| `sentinel.auth.enabled` / `sentinel.auth.password` | `false` / `""` | Password for Sentinel (defaults to `redis.auth.password`); Sentinel-aware clients must then use it |
 | `sentinel.configuration` | `""` | Extra lines appended to `sentinel.conf` |
 | `sentinel.cleanupInterval` | `30` | Seconds between checks of the `cleanup` sidecar |
 | `haproxy.enabled` | `true` | Deploy HAProxy and the `<fullname>-redis-dynamic` Service |
@@ -114,6 +115,9 @@ kubectl exec <fullname>-sentinel-0 -- redis-cli -p 26379 sentinel failover mymas
 # Scale Redis (HAProxy picks up the new pods automatically)
 helm upgrade redis-sentinel . --reuse-values --set redis.replicas=5
 ```
+
+With `sentinel.auth.enabled`, prefix the Sentinel commands with the password, e.g.
+`kubectl exec <fullname>-sentinel-0 -c sentinel -- sh -c 'REDISCLI_AUTH="$SENTINEL_PASSWORD" redis-cli -p 26379 ...'`.
 
 Keep `sentinel.replicas` odd and `sentinel.quorum` a majority of it.
 
@@ -160,7 +164,12 @@ kubectl delete pvc -l app.kubernetes.io/instance=redis-sentinel
 ## Security Considerations
 
 - Set a strong `redis.auth.password`; passwords are only stored in the chart's Secret.
-- Sentinel itself has no password; restrict access to port 26379 with a NetworkPolicy.
+- Sentinel has no password by default (for compatibility with existing Sentinel-aware clients). Anyone
+  who can reach port 26379 can then reconfigure it and point the replicas at a host of their choice,
+  which receives the Redis password. Enable `sentinel.auth` (and configure the password in your
+  Sentinel-aware clients), or restrict access to port 26379 with a NetworkPolicy.
+- The chart's scripts only connect to the release's own Redis pods, so an address reported by a
+  reconfigured Sentinel is ignored instead of receiving the password.
 - Pods run as non-root with a read-only root filesystem and no service account token.
 
 ## License

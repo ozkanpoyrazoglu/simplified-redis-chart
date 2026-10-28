@@ -135,6 +135,24 @@ Environment for the init scripts in the scripts ConfigMap
       name: {{ include "redis-sentinel.fullname" . }}-auth
       key: redis-password
 {{- end }}
+{{- include "redis-sentinel.sentinel.passwordEnv" . }}
+{{- end }}
+
+{{- define "redis-sentinel.sentinel.password" -}}
+{{- .Values.sentinel.auth.password | default .Values.redis.auth.password -}}
+{{- end }}
+
+{{/*
+SENTINEL_PASSWORD env entry, empty when sentinel.auth is disabled
+*/}}
+{{- define "redis-sentinel.sentinel.passwordEnv" -}}
+{{- if .Values.sentinel.auth.enabled }}
+- name: SENTINEL_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "redis-sentinel.fullname" . }}-auth
+      key: sentinel-password
+{{- end }}
 {{- end }}
 
 {{/*
@@ -181,6 +199,9 @@ Fail early on values from chart 1.x that no longer apply
 {{- end }}
 {{- if and .Values.redis.auth.enabled (not .Values.redis.auth.password) }}
 {{- fail "redis.auth.password is required when redis.auth.enabled is true" }}
+{{- end }}
+{{- if and .Values.sentinel.auth.enabled (not (include "redis-sentinel.sentinel.password" .)) }}
+{{- fail "sentinel.auth.enabled needs sentinel.auth.password (or redis.auth.password)" }}
 {{- end }}
 {{- /* passwords are appended from the Secret and win over these lines, so a different value would silently change the password */}}
 {{- range $key := list "requirepass" "masterauth" }}

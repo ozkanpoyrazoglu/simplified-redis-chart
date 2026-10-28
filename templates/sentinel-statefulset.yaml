@@ -57,6 +57,10 @@ spec:
         command:
         - redis-sentinel
         - /data/sentinel.conf
+        {{- with (include "redis-sentinel.sentinel.passwordEnv" .) }}
+        env:
+          {{- . | nindent 10 }}
+        {{- end }}
         volumeMounts:
         - name: sentinel-data
           mountPath: /data
@@ -69,7 +73,8 @@ spec:
             command:
             - sh
             - -c
-            - redis-cli -p 26379 ping | grep -q PONG
+            # REDISCLI_AUTH is not set in this container, so pass the Sentinel password explicitly
+            - REDISCLI_AUTH="$SENTINEL_PASSWORD"; [ -n "$REDISCLI_AUTH" ] && export REDISCLI_AUTH; redis-cli -p 26379 ping | grep -q PONG
           initialDelaySeconds: 30
           periodSeconds: 10
           timeoutSeconds: 3
@@ -78,7 +83,8 @@ spec:
             command:
             - sh
             - -c
-            - redis-cli -p 26379 ping | grep -q PONG
+            # REDISCLI_AUTH is not set in this container, so pass the Sentinel password explicitly
+            - REDISCLI_AUTH="$SENTINEL_PASSWORD"; [ -n "$REDISCLI_AUTH" ] && export REDISCLI_AUTH; redis-cli -p 26379 ping | grep -q PONG
           initialDelaySeconds: 5
           periodSeconds: 5
           timeoutSeconds: 3

@@ -34,7 +34,8 @@ metadata:
     {{- include "redis-sentinel.labels" . | nindent 4 }}
 data:
   common.sh: |
-    # Shared helpers. REDISCLI_AUTH (from the Secret) is used by redis-cli for Redis pods.
+    # Shared helpers. REDISCLI_AUTH (from the Secret) is used by redis-cli for Redis pods,
+    # SENTINEL_PASSWORD (when sentinel.auth is enabled) for Sentinel.
 
     redis_host() {
       echo "${REDIS_SERVICE}-$1.${REDIS_SERVICE}.${NAMESPACE}.svc.${CLUSTER_DOMAIN}"
@@ -44,30 +45,39 @@ data:
       nslookup "$1" 2>/dev/null | awk '/^Name:/ {f=1} f && /^Address/ {print $NF; exit}'
     }
 
-    # Sentinel may report a master by IP; map it back to the pod hostname when possible
+    # Prints the pod hostname for $1 (a hostname, or the current IP of a pod), or nothing when $1 is
+    # not a Redis pod of this release. Addresses reported by Sentinel go through this before the
+    # password is sent anywhere, since Sentinel can be reconfigured by anyone who reaches it.
     to_redis_host() {
-      case "$1" in
-        *[a-z]*) echo "$1"; return ;;
-      esac
       i=0
       while [ "$i" -lt "$REDIS_REPLICAS" ]; do
         h=$(redis_host "$i")
-        if [ "$(resolve "$h")" = "$1" ]; then
+        if [ "$h" = "$1" ] || [ "$(resolve "$h")" = "$1" ]; then
           echo "$h"
           return
         fi
         i=$((i + 1))
       done
-      echo "$1"
     }
 
     redis_role() {
       timeout 3 redis-cli -h "$1" -p 6379 role 2>/dev/null | head -1
     }
 
+    # sentinel_cli <host> <port> <args>: REDISCLI_AUTH holds the Redis password, not Sentinel's
+    sentinel_cli() {
+      h=$1
+      p=$2
+      shift 2
+      if [ -n "${SENTINEL_PASSWORD:-}" ]; then
+        REDISCLI_AUTH=$SENTINEL_PASSWORD timeout 3 redis-cli -h "$h" -p "$p" "$@" 2>/dev/null
+      else
+        env -u REDISCLI_AUTH timeout 3 redis-cli -h "$h" -p "$p" "$@" 2>/dev/null
+      fi
+    }
+
     sentinel_master() {
-      env -u REDISCLI_AUTH timeout 3 redis-cli -h "$1" -p "$2" \
-        sentinel get-master-addr-by-name "$MASTER_SET" 2>/dev/null | head -1
+      sentinel_cli "$1" "$2" sentinel get-master-addr-by-name "$MASTER_SET" | head -1
     }
 
     # Prints the hostname of a Redis pod (other than $1) that currently reports role master
@@ -105,14 +115,22 @@ data:
 
     # Sentinel is the source of truth for the current master; follow it when it answers
     # so a restarted former master never comes back as a second master.
-    MASTER=$(sentinel_master "$SENTINEL_SERVICE" "$SENTINEL_SERVICE_PORT")
+    REPORTED=$(sentinel_master "$SENTINEL_SERVICE" "$SENTINEL_SERVICE_PORT")
+    MASTER=""
+    if [ -n "$REPORTED" ]; then
+      if [ "$REPORTED" = "${POD_IP:-}" ]; then
+        MASTER=$MY_HOST
+      else
+        MASTER=$(to_redis_host "$REPORTED")
+      fi
+      [ -n "$MASTER" ] || echo "Ignoring Sentinel master $REPORTED: not a pod of this release (or gone)"
+    fi
     if [ -n "$MASTER" ]; then
-      MASTER=$(to_redis_host "$MASTER")
       echo "Sentinel reports master: $MASTER"
       # Sentinel still names this pod although it just restarted, i.e. it has not noticed yet.
       # Give it time to promote a replica instead of coming back as a second master next to it;
       # start as master only when no failover happens (no usable replica, whole-cluster restart).
-      if { [ "$MASTER" = "$MY_HOST" ] || [ "$MASTER" = "${POD_IP:-}" ]; } && [ "$REDIS_REPLICAS" -gt 1 ]; then
+      if [ "$MASTER" = "$MY_HOST" ] && [ "$REDIS_REPLICAS" -gt 1 ]; then
         echo "Waiting up to {{ $failoverWait }}s for Sentinel to fail over"
         END=$(( $(date +%s) + {{ $failoverWait }} ))
         while [ "$(date +%s)" -lt "$END" ]; do
@@ -128,7 +146,12 @@ data:
     else
       MASTER=$(find_running_master "$MY_HOST")
       if [ -n "$MASTER" ]; then
-        echo "Sentinel unavailable, found running master: $MASTER"
+        echo "Found running master: $MASTER"
+      elif [ -n "$REPORTED" ] && [ "$REDIS_REPLICAS" -gt 1 ]; then
+        # Sentinel tracks a master that is gone (e.g. a pod IP from an older chart version): do not
+        # become a master next to it, wait as a replica until Sentinel promotes one
+        if [ "${HOSTNAME##*-}" = "0" ]; then MASTER=$(redis_host 1); else MASTER=$(redis_host 0); fi
+        echo "No usable master, waiting for Sentinel to promote a replica"
       elif [ "${HOSTNAME##*-}" = "0" ]; then
         MASTER=$MY_HOST
         echo "Sentinel unavailable and no running master, bootstrapping as master"
@@ -138,7 +161,7 @@ data:
       fi
     fi
 
-    if [ "$MASTER" = "$MY_HOST" ] || [ "$MASTER" = "${POD_IP:-}" ]; then
+    if [ "$MASTER" = "$MY_HOST" ]; then
       echo "Starting as master"
     else
       echo "Starting as replica of $MASTER"
@@ -154,7 +177,8 @@ data:
     INFO=$(redis-cli info replication 2>/dev/null | tr -d '\r')
     echo "$INFO" | grep -qE '^role:master|^master_link_status:up' && exit 0
     echo "$INFO" | grep -q '^role:slave' || exit 1
-    [ "$(redis_role "$(echo "$INFO" | awk -F: '/^master_host:/ {print $2}')")" != "master" ]
+    MASTER=$(to_redis_host "$(echo "$INFO" | awk -F: '/^master_host:/ {print $2}')")
+    [ -z "$MASTER" ] || [ "$(redis_role "$MASTER")" != "master" ]
 
   prestop-redis.sh: |
     #!/bin/sh
@@ -171,8 +195,7 @@ data:
     [ "$REDIS_REPLICAS" -gt 1 ] || exit 0
 
     echo "preStop: master is stopping, asking Sentinel for a failover"
-    if ! env -u REDISCLI_AUTH timeout 3 redis-cli -h "$SENTINEL_SERVICE" -p "$SENTINEL_SERVICE_PORT" \
-        sentinel failover "$MASTER_SET" | grep -q OK; then
+    if ! sentinel_cli "$SENTINEL_SERVICE" "$SENTINEL_SERVICE_PORT" sentinel failover "$MASTER_SET" | grep -q OK; then
       echo "preStop: Sentinel refused the failover"
       exit 0
     fi
@@ -211,8 +234,8 @@ data:
       peer="${SENTINEL_SERVICE}-$i.${SENTINEL_SERVICE}.${NAMESPACE}.svc.${CLUSTER_DOMAIN}"
       if [ "$peer" != "$MY_HOST" ]; then
         candidate=$(sentinel_master "$peer" 26379)
+        [ -z "$candidate" ] || candidate=$(to_redis_host "$candidate")
         if [ -n "$candidate" ]; then
-          candidate=$(to_redis_host "$candidate")
           if [ "$(redis_role "$candidate")" = "master" ]; then
             MASTER=$candidate
             echo "Peer $peer reports master: $MASTER"
@@ -259,6 +282,10 @@ data:
     if [ -n "${REDISCLI_AUTH:-}" ]; then
       echo "sentinel auth-pass $MASTER_SET \"$REDISCLI_AUTH\"" >> "$CONF"
     fi
+    if [ -n "${SENTINEL_PASSWORD:-}" ]; then
+      echo "requirepass \"$SENTINEL_PASSWORD\"" >> "$CONF"
+      echo "sentinel sentinel-pass \"$SENTINEL_PASSWORD\"" >> "$CONF"
+    fi
     cat /opt/sentinel-readonly/extra.conf >> "$CONF"
     chmod 600 "$CONF"
 
@@ -268,8 +295,9 @@ data:
     # that did not announce hostnames) stay around as duplicates of the hostname entries; they count
     # towards the failover majority and, once the IP is reused, can make Sentinel reconfigure the
     # wrong pod. Reset the master set once every pod is healthy under its hostname.
+    . /opt/scripts/common.sh
     sentinel() {
-      env -u REDISCLI_AUTH timeout 3 redis-cli -p 26379 sentinel "$@" 2>/dev/null
+      sentinel_cli localhost 26379 sentinel "$@"
     }
 
     # redis-cli prints each entry as alternating key/value lines; prints "<ip> <flags>" per entry

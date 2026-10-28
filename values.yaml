@@ -93,6 +93,14 @@ sentinel:
 
   # Name of the monitored master set, used by Sentinel-aware clients
   masterSet: mymaster
+  # Password for Sentinel itself (requirepass), also used between Sentinels. Off by default for
+  # compatibility; when enabled, Sentinel-aware clients must be given this password. Without it, anyone
+  # who can reach port 26379 can reconfigure Sentinel, so enable it or restrict access to that port.
+  auth:
+    enabled: false
+    # Defaults to redis.auth.password when empty
+    password: ""
+
   # Number of Sentinels that must agree the master is down; keep it a majority of sentinel.replicas
   quorum: 2
   downAfterMilliseconds: 5000
