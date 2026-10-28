@@ -1,0 +1,32 @@
+{{- $fullname := include "redis-sentinel.fullname" . -}}
+Redis with Sentinel is deployed: {{ .Values.redis.replicas }} Redis pods and {{ .Values.sentinel.replicas }} Sentinels.
+
+Connect to the current master:
+{{- if eq (include "redis-sentinel.haproxy.enabled" .) "true" }}
+  * Clients without Sentinel support (via HAProxy, follows failover):
+      {{ $fullname }}-redis-dynamic.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:{{ .Values.haproxy.service.port }}
+{{- end }}
+  * Sentinel-aware clients:
+      sentinel {{ $fullname }}-sentinel.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:{{ .Values.service.sentinel.port }}, master set "{{ .Values.sentinel.masterSet }}"
+      {{- if .Values.sentinel.auth.enabled }}, Sentinel password in Secret {{ $fullname }}-auth (key sentinel-password){{ end }}
+
+{{ $fullname }}-redis:{{ .Values.service.redis.port }} balances across all Redis pods, including replicas;
+use it only for reads.
+
+Check the current master:
+{{- if .Values.sentinel.auth.enabled }}
+  kubectl -n {{ .Release.Namespace }} exec {{ $fullname }}-sentinel-0 -c sentinel -- sh -c 'REDISCLI_AUTH="$SENTINEL_PASSWORD" redis-cli -p 26379 sentinel get-master-addr-by-name {{ .Values.sentinel.masterSet }}'
+{{- else }}
+  kubectl -n {{ .Release.Namespace }} exec {{ $fullname }}-sentinel-0 -c sentinel -- redis-cli -p 26379 sentinel get-master-addr-by-name {{ .Values.sentinel.masterSet }}
+{{- end }}
+{{- if not .Values.sentinel.auth.enabled }}
+
+WARNING: Sentinel has no password (sentinel.auth.enabled=false). Anyone who can reach port 26379 can
+point Sentinel at another host, which then receives the Redis password from the replicas. Enable
+sentinel.auth or restrict access to port 26379 with a NetworkPolicy.
+{{- end }}
+{{- if hasKey (.Values.service.redis | default dict) "endpointController" }}
+
+NOTE: service.redis.endpointController is deprecated. {{ $fullname }}-redis-dynamic is now served by HAProxy;
+use haproxy.enabled instead.
+{{- end }}

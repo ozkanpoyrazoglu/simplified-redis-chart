@@ -2,7 +2,7 @@ apiVersion: v2
 name: redis-sentinel
 description: A Helm chart for Redis with Sentinel for high availability
 type: application
-version: 1.0.0
+version: 2.0.0
 appVersion: "7.2"
 keywords:
   - redis
@@ -13,6 +13,7 @@ keywords:
 home: https://redis.io
 sources:
   - https://github.com/redis/redis
+  - https://github.com/ozkanpoyrazoglu/simplified-redis-chart
 maintainers:
   - name: Özkan Poyrazoğlu
     email: ozkanpoyrazoglu@gmail.com

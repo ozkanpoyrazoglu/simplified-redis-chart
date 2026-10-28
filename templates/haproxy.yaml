@@ -1,0 +1,109 @@
+{{- if eq (include "redis-sentinel.haproxy.enabled" .) "true" }}
+{{- $fullname := include "redis-sentinel.fullname" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-haproxy
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: haproxy
+spec:
+  replicas: {{ .Values.haproxy.replicas }}
+  selector:
+    matchLabels:
+      {{- include "redis-sentinel.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: haproxy
+  template:
+    metadata:
+      labels:
+        {{- include "redis-sentinel.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: haproxy
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/haproxy-configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "redis-sentinel.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+      - name: haproxy
+        image: {{ include "redis-sentinel.haproxy.image" . }}
+        imagePullPolicy: {{ .Values.haproxy.image.pullPolicy }}
+        command:
+        - haproxy
+        - -W
+        - -db
+        - -f
+        - /usr/local/etc/haproxy/haproxy.cfg
+        securityContext:
+          {{- toYaml .Values.securityContext | nindent 10 }}
+        ports:
+        - containerPort: 6379
+          name: redis
+        - containerPort: 8888
+          name: health
+        env:
+        {{- if .Values.redis.auth.enabled }}
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ $fullname }}-auth
+              key: redis-password
+        {{- end }}
+        volumeMounts:
+        - name: config
+          mountPath: /usr/local/etc/haproxy
+        resources:
+          {{- toYaml .Values.haproxy.resources | nindent 10 }}
+        livenessProbe:
+          tcpSocket:
+            port: health
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          periodSeconds: 2
+          failureThreshold: 2
+      volumes:
+      - name: config
+        configMap:
+          name: {{ $fullname }}-haproxy
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (include "redis-sentinel.affinity" (dict "ctx" $ "component" "haproxy")) }}
+      affinity:
+        {{- . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+# Master endpoint for clients without Sentinel support (name kept from the 1.x endpoint controller)
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-redis-dynamic
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis-dynamic
+  {{- with .Values.haproxy.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.haproxy.service.type }}
+  ports:
+  - port: {{ .Values.haproxy.service.port }}
+    targetPort: redis
+    protocol: TCP
+    name: redis
+  selector:
+    {{- include "redis-sentinel.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: haproxy
+{{- end }}

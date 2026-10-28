@@ -1,0 +1,22 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+{{- $components := list "redis" "sentinel" }}
+{{- if eq (include "redis-sentinel.haproxy.enabled" .) "true" }}
+{{- $components = append $components "haproxy" }}
+{{- end }}
+{{- range $components }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "redis-sentinel.fullname" $ }}-{{ . }}
+  labels:
+    {{- include "redis-sentinel.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ . }}
+spec:
+  minAvailable: {{ $.Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "redis-sentinel.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/component: {{ . }}
+{{- end }}
+{{- end }}
