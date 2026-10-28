@@ -1,3 +1,9 @@
+nameOverride: ""
+fullnameOverride: ""
+
+# Kubernetes cluster DNS domain, used to build pod hostnames
+clusterDomain: cluster.local
+
 # Global configurations
 global:
   imageRegistry: ""
@@ -10,16 +16,18 @@ redis:
     repository: redis
     tag: "7.2-alpine"
     pullPolicy: IfNotPresent
-  
-  # Redis master configuration
-  master:
-    replicas: 1
-    
-  # Redis replica configuration  
-  replica:
-    enabled: true
-    replicas: 2
-    
+
+  # Number of Redis pods (1 master + N-1 replicas). Sentinel decides which pod is the master.
+  replicas: 3
+
+  # A stopping master asks Sentinel for a failover and waits up to this many seconds for it
+  preStopFailoverTimeout: 20
+  terminationGracePeriodSeconds: 60
+  # How long a starting replica may take to finish its initial sync before it is restarted
+  startupTimeoutSeconds: 600
+  # Wait after a pod is ready before a rolling update moves on to the next one
+  minReadySeconds: 15
+
   # Authentication
   auth:
     enabled: true
@@ -29,7 +37,7 @@ redis:
     # "keys" and "channels" are Redis key (~pattern) and pub/sub channel (&pattern) rules.
     # Nothing is added when they are omitted, and Redis then grants no key or channel access.
     acl:
-      enabled: true
+      enabled: false
       users:
         - username: "admin"
           password: "admin-password-123"
@@ -46,16 +54,16 @@ redis:
           keys: "~*"
           channels: "&*"
           permissions: "+@all -@dangerous"
-  
+
   # Redis configuration parameters
+  # Passwords (requirepass/masterauth) are added from the Secret; do not put them here.
   configuration: |
-    # Redis configuration
     maxmemory 256mb
     maxmemory-policy allkeys-lru
     save 900 1
     save 300 10
     save 60 10000
-    
+
   # Persistence
   persistence:
     enabled: true
@@ -63,7 +71,7 @@ redis:
     size: 8Gi
     accessModes:
       - ReadWriteOnce
-  
+
   # Resources
   resources:
     limits:
@@ -80,14 +88,31 @@ sentinel:
     repository: redis
     tag: "7.2-alpine"
     pullPolicy: IfNotPresent
-    
+
   replicas: 3
-  
-  # Sentinel configuration - hostname will be templated in configmap
-  configuration: |
-    # Additional sentinel configuration
-    # Monitor configuration is handled in configmap template
-    
+
+  # Name of the monitored master set, used by Sentinel-aware clients
+  masterSet: mymaster
+  # Number of Sentinels that must agree the master is down; keep it a majority of sentinel.replicas
+  quorum: 2
+  downAfterMilliseconds: 5000
+  failoverTimeout: 10000
+  parallelSyncs: 1
+
+  # Additional sentinel configuration, appended to the generated sentinel.conf
+  configuration: ""
+
+  # A sidecar checks this often (seconds) for IP-addressed leftovers, e.g. after upgrading from
+  # a version that did not announce hostnames, and clears them with SENTINEL RESET
+  cleanupInterval: 30
+  cleanupResources:
+    limits:
+      cpu: 50m
+      memory: 32Mi
+    requests:
+      cpu: 5m
+      memory: 8Mi
+
   # Resources
   resources:
     limits:
@@ -97,13 +122,59 @@ sentinel:
       cpu: 50m
       memory: 64Mi
 
+# HAProxy in front of Redis that always routes to the current master.
+# Clients without Sentinel support connect to <fullname>-redis-dynamic:6379.
+haproxy:
+  enabled: true
+  replicas: 2
+  image:
+    registry: docker.io
+    repository: haproxy
+    tag: "3.2.26-alpine"
+    pullPolicy: IfNotPresent
+
+  # Health check of each Redis pod (AUTH + role:master)
+  check:
+    interval: 1s
+    # Consecutive failed/successful checks before a pod is taken out of / put into rotation
+    fall: 2
+    rise: 2
+
+  timeout:
+    connect: 4s
+    # Idle client/server connections are closed after this time
+    client: 330s
+    server: 330s
+    check: 2s
+
+  maxConnections: 4096
+
+  service:
+    type: ClusterIP
+    port: 6379
+    annotations: {}
+
+  resources:
+    limits:
+      cpu: 200m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
 # Service configurations
 service:
+  # <fullname>-redis: all Redis pods, master and replicas (writes may hit a replica)
   redis:
     type: ClusterIP
     port: 6379
     annotations: {}
-    
+
+    # Headless service for direct Redis pod access
+    headless:
+      enabled: true
+      annotations: {}
+
   sentinel:
     type: ClusterIP
     port: 26379
@@ -136,24 +207,11 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
-# Pod disruption budget
+# Spread pods of each component across nodes: "soft", "hard" or "" (disabled).
+# Ignored when affinity is set.
+podAntiAffinityPreset: soft
+
+# Pod disruption budget (one per component)
 podDisruptionBudget:
   enabled: true
   minAvailable: 1
-
-# Monitoring
-metrics:
-  enabled: false
-  image:
-    registry: docker.io
-    repository: oliver006/redis_exporter
-    tag: v1.45.0
-    pullPolicy: IfNotPresent
-  port: 9121
-  resources:
-    limits:
-      cpu: 100m
-      memory: 64Mi
-    requests:
-      cpu: 10m
-      memory: 32Mi

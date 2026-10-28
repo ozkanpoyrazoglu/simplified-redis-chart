@@ -1,12 +1,14 @@
+{{- $fullname := include "redis-sentinel.fullname" . }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "redis-sentinel.fullname" . }}-sentinel
+  name: {{ $fullname }}-sentinel
   labels:
     {{- include "redis-sentinel.labels" . | nindent 4 }}
     app.kubernetes.io/component: sentinel
 spec:
-  serviceName: {{ include "redis-sentinel.fullname" . }}-sentinel
+  # selector and serviceName are immutable: keep them stable across chart versions
+  serviceName: {{ $fullname }}-sentinel
   replicas: {{ .Values.sentinel.replicas }}
   selector:
     matchLabels:
@@ -17,26 +19,32 @@ spec:
       labels:
         {{- include "redis-sentinel.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: sentinel
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ include "redis-sentinel.serviceAccountName" . }}
+      automountServiceAccountToken: false
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       initContainers:
       - name: config-init
         image: {{ include "redis-sentinel.sentinel.image" . }}
+        imagePullPolicy: {{ .Values.sentinel.image.pullPolicy }}
         command:
         - sh
-        - -c
-        - |
-          cp /opt/sentinel-readonly/sentinel.conf /data/sentinel.conf
-          chmod 666 /data/sentinel.conf
+        - /opt/scripts/init-sentinel.sh
+        env:
+        {{- include "redis-sentinel.scriptEnv" . | nindent 8 }}
+        securityContext:
+          {{- toYaml .Values.securityContext | nindent 10 }}
         volumeMounts:
         - name: sentinel-config-readonly
           mountPath: /opt/sentinel-readonly
+        - name: scripts
+          mountPath: /opt/scripts
         - name: sentinel-data
           mountPath: /data
-        securityContext:
-          runAsUser: 999
       containers:
       - name: sentinel
         image: {{ include "redis-sentinel.sentinel.image" . }}
@@ -50,8 +58,6 @@ spec:
         - redis-sentinel
         - /data/sentinel.conf
         volumeMounts:
-        - name: sentinel-config-readonly
-          mountPath: /opt/sentinel-readonly
         - name: sentinel-data
           mountPath: /data
         - name: tmp
@@ -61,25 +67,43 @@ spec:
         livenessProbe:
           exec:
             command:
-            - redis-cli
-            - -p
-            - "26379"
-            - ping
+            - sh
+            - -c
+            - redis-cli -p 26379 ping | grep -q PONG
           initialDelaySeconds: 30
           periodSeconds: 10
+          timeoutSeconds: 3
         readinessProbe:
           exec:
             command:
-            - redis-cli
-            - -p
-            - "26379"
-            - ping
+            - sh
+            - -c
+            - redis-cli -p 26379 ping | grep -q PONG
           initialDelaySeconds: 5
           periodSeconds: 5
+          timeoutSeconds: 3
+      - name: cleanup
+        image: {{ include "redis-sentinel.sentinel.image" . }}
+        imagePullPolicy: {{ .Values.sentinel.image.pullPolicy }}
+        securityContext:
+          {{- toYaml .Values.securityContext | nindent 10 }}
+        command:
+        - sh
+        - /opt/scripts/sentinel-cleanup.sh
+        env:
+        {{- include "redis-sentinel.scriptEnv" . | nindent 8 }}
+        volumeMounts:
+        - name: scripts
+          mountPath: /opt/scripts
+        resources:
+          {{- toYaml .Values.sentinel.cleanupResources | nindent 10 }}
       volumes:
       - name: sentinel-config-readonly
         configMap:
-          name: {{ include "redis-sentinel.fullname" . }}-sentinel-config
+          name: {{ $fullname }}-sentinel-config
+      - name: scripts
+        configMap:
+          name: {{ $fullname }}-scripts
       - name: sentinel-data
         emptyDir: {}
       - name: tmp
@@ -88,9 +112,9 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- with (include "redis-sentinel.affinity" (dict "ctx" $ "component" "sentinel")) }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- . | nindent 8 }}
       {{- end }}
       {{- with .Values.tolerations }}
       tolerations:

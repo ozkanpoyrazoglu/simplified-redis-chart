@@ -1,0 +1,65 @@
+{{- if eq (include "redis-sentinel.haproxy.enabled" .) "true" }}
+{{- $fullname := include "redis-sentinel.fullname" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-haproxy
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: haproxy
+data:
+  haproxy.cfg: |
+    global
+      log stdout format raw local0 notice
+      maxconn {{ .Values.haproxy.maxConnections }}
+
+    defaults
+      mode tcp
+      log global
+      option dontlognull
+      timeout connect {{ .Values.haproxy.timeout.connect }}
+      timeout client {{ .Values.haproxy.timeout.client }}
+      timeout server {{ .Values.haproxy.timeout.server }}
+      timeout check {{ .Values.haproxy.timeout.check }}
+
+    resolvers k8s
+      parse-resolv-conf
+      hold valid 5s
+      hold other 5s
+      hold refused 5s
+      hold nx 5s
+      hold timeout 5s
+      hold obsolete 5s
+
+    # Ready only while a master is in rotation, so the Service has no endpoints without one
+    frontend health
+      mode http
+      bind :8888
+      monitor-uri /healthz
+      acl no_master nbsrv(redis_master) lt 1
+      monitor fail if no_master
+
+    frontend redis_master
+      bind :6379
+      default_backend redis_master
+
+    backend redis_master
+      # "first" sends every connection to the same pod even if two briefly claim to be master
+      balance first
+      option tcp-check
+      tcp-check connect
+      {{- if .Values.redis.auth.enabled }}
+      tcp-check send "AUTH ${REDIS_PASSWORD}"\r\n
+      tcp-check expect string +OK
+      {{- end }}
+      tcp-check send PING\r\n
+      tcp-check expect string +PONG
+      tcp-check send info\ replication\r\n
+      tcp-check expect string role:master
+      tcp-check send QUIT\r\n
+      tcp-check expect string +OK
+      default-server check inter {{ .Values.haproxy.check.interval }} fall {{ .Values.haproxy.check.fall }} rise {{ .Values.haproxy.check.rise }} on-marked-down shutdown-sessions resolvers k8s init-addr none init-state down
+      {{- range $i, $_ := until (int .Values.redis.replicas) }}
+      server redis-{{ $i }} {{ include "redis-sentinel.redis.podHost" (list $ $i) }}:6379
+      {{- end }}
+{{- end }}

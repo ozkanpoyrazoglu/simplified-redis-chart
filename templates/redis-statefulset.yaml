@@ -1,26 +1,55 @@
+{{- include "redis-sentinel.validate" . }}
+{{- $fullname := include "redis-sentinel.fullname" . }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "redis-sentinel.fullname" . }}-redis-master
+  name: {{ $fullname }}-redis
   labels:
     {{- include "redis-sentinel.labels" . | nindent 4 }}
-    app.kubernetes.io/component: redis-master
+    app.kubernetes.io/component: redis
 spec:
-  serviceName: {{ include "redis-sentinel.fullname" . }}-redis-master
-  replicas: {{ .Values.redis.master.replicas }}
+  # selector, serviceName and volumeClaimTemplates are immutable: keep them stable across chart versions
+  serviceName: {{ $fullname }}-redis
+  replicas: {{ .Values.redis.replicas }}
+  # gives Sentinel (10s INFO refresh) time to register a restarted replica before the next pod stops
+  minReadySeconds: {{ .Values.redis.minReadySeconds }}
   selector:
     matchLabels:
       {{- include "redis-sentinel.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: redis-master
+      app.kubernetes.io/component: redis
   template:
     metadata:
       labels:
         {{- include "redis-sentinel.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: redis-master
+        app.kubernetes.io/component: redis
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ include "redis-sentinel.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      # leaves time for the preStop failover plus a final save
+      terminationGracePeriodSeconds: {{ .Values.redis.terminationGracePeriodSeconds }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+      - name: redis-config-init
+        image: {{ include "redis-sentinel.redis.image" . }}
+        imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+        command:
+        - sh
+        - /opt/scripts/init-redis.sh
+        env:
+        {{- include "redis-sentinel.scriptEnv" . | nindent 8 }}
+        securityContext:
+          {{- toYaml .Values.securityContext | nindent 10 }}
+        volumeMounts:
+        - name: redis-config-readonly
+          mountPath: /opt/redis-readonly
+        - name: scripts
+          mountPath: /opt/scripts
+        - name: redis-data
+          mountPath: /data
       containers:
       - name: redis
         image: {{ include "redis-sentinel.redis.image" . }}
@@ -32,47 +61,74 @@ spec:
           name: redis
         command:
         - redis-server
-        - /opt/redis/redis.conf
+        - /data/redis.conf
+        # REDISCLI_AUTH is read automatically by redis-cli (probes, preStop)
         env:
-        {{- if .Values.redis.auth.enabled }}
-        # read automatically by redis-cli (used by probes)
-        - name: REDISCLI_AUTH
-          valueFrom:
-            secretKeyRef:
-              name: {{ include "redis-sentinel.fullname" . }}-auth
-              key: redis-password
-        {{- end }}
+        {{- include "redis-sentinel.scriptEnv" . | nindent 8 }}
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - sh
+              - /opt/scripts/prestop-redis.sh
         volumeMounts:
-        - name: redis-config
-          mountPath: /opt/redis
+        - name: scripts
+          mountPath: /opt/scripts
         - name: redis-data
           mountPath: /data
+        {{- if and .Values.redis.auth.enabled .Values.redis.auth.acl.enabled }}
+        - name: redis-acl
+          mountPath: /opt/redis-acl
+          readOnly: true
+        {{- end }}
         - name: tmp
           mountPath: /tmp
         resources:
           {{- toYaml .Values.redis.resources | nindent 10 }}
+        # A replica only becomes ready once it has synced, so a rolling update never stops the
+        # next pod while no replica is able to take over
+        startupProbe:
+          exec:
+            command:
+            - sh
+            - /opt/scripts/check-sync.sh
+          periodSeconds: 2
+          timeoutSeconds: 5
+          failureThreshold: {{ div (int .Values.redis.startupTimeoutSeconds) 2 }}
         livenessProbe:
           exec:
             command:
             - sh
             - -c
-            # redis-cli exits 0 on error replies (e.g. NOAUTH), so check the reply
-            - redis-cli ping | grep -q PONG
+            # redis-cli exits 0 on error replies, so check the reply; LOADING is alive
+            - redis-cli ping | grep -qE 'PONG|LOADING'
           initialDelaySeconds: 30
           periodSeconds: 10
+          timeoutSeconds: 3
         readinessProbe:
           exec:
             command:
             - sh
             - -c
-            # redis-cli exits 0 on error replies (e.g. NOAUTH), so check the reply
             - redis-cli ping | grep -q PONG
           initialDelaySeconds: 5
           periodSeconds: 5
+          timeoutSeconds: 3
       volumes:
-      - name: redis-config
+      - name: redis-config-readonly
         configMap:
-          name: {{ include "redis-sentinel.fullname" . }}-redis-config
+          name: {{ $fullname }}-redis-config
+      - name: scripts
+        configMap:
+          name: {{ $fullname }}-scripts
+      {{- if and .Values.redis.auth.enabled .Values.redis.auth.acl.enabled }}
+      - name: redis-acl
+        secret:
+          secretName: {{ $fullname }}-auth
+          items:
+          - key: acl.conf
+            path: acl.conf
+      {{- end }}
       - name: tmp
         emptyDir: {}
       {{- if not .Values.redis.persistence.enabled }}
@@ -83,9 +139,9 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- with (include "redis-sentinel.affinity" (dict "ctx" $ "component" "redis")) }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- . | nindent 8 }}
       {{- end }}
       {{- with .Values.tolerations }}
       tolerations:
@@ -113,124 +169,3 @@ spec:
         requests:
           storage: {{ .Values.redis.persistence.size | quote }}
   {{- end }}
----
-{{- if .Values.redis.replica.enabled }}
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: {{ include "redis-sentinel.fullname" . }}-redis-replica
-  labels:
-    {{- include "redis-sentinel.labels" . | nindent 4 }}
-    app.kubernetes.io/component: redis-replica
-spec:
-  serviceName: {{ include "redis-sentinel.fullname" . }}-redis-replica
-  replicas: {{ .Values.redis.replica.replicas }}
-  selector:
-    matchLabels:
-      {{- include "redis-sentinel.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: redis-replica
-  template:
-    metadata:
-      labels:
-        {{- include "redis-sentinel.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: redis-replica
-    spec:
-      serviceAccountName: {{ include "redis-sentinel.serviceAccountName" . }}
-      securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      containers:
-      - name: redis
-        image: {{ include "redis-sentinel.redis.image" . }}
-        imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
-        securityContext:
-          {{- toYaml .Values.securityContext | nindent 10 }}
-        ports:
-        - containerPort: 6379
-          name: redis
-        command:
-        - redis-server
-        - /opt/redis/redis.conf
-        - --replicaof
-        - {{ include "redis-sentinel.masterHost" . }}
-        - "6379"
-        env:
-        {{- if .Values.redis.auth.enabled }}
-        # read automatically by redis-cli (used by probes)
-        - name: REDISCLI_AUTH
-          valueFrom:
-            secretKeyRef:
-              name: {{ include "redis-sentinel.fullname" . }}-auth
-              key: redis-password
-        {{- end }}
-        volumeMounts:
-        - name: redis-config
-          mountPath: /opt/redis
-        - name: redis-data
-          mountPath: /data
-        - name: tmp
-          mountPath: /tmp
-        resources:
-          {{- toYaml .Values.redis.resources | nindent 10 }}
-        livenessProbe:
-          exec:
-            command:
-            - sh
-            - -c
-            # redis-cli exits 0 on error replies (e.g. NOAUTH), so check the reply
-            - redis-cli ping | grep -q PONG
-          initialDelaySeconds: 30
-          periodSeconds: 10
-        readinessProbe:
-          exec:
-            command:
-            - sh
-            - -c
-            # redis-cli exits 0 on error replies (e.g. NOAUTH), so check the reply
-            - redis-cli ping | grep -q PONG
-          initialDelaySeconds: 5
-          periodSeconds: 5
-      volumes:
-      - name: redis-config
-        configMap:
-          name: {{ include "redis-sentinel.fullname" . }}-redis-config
-      - name: tmp
-        emptyDir: {}
-      {{- if not .Values.redis.persistence.enabled }}
-      - name: redis-data
-        emptyDir: {}
-      {{- end }}
-      {{- with .Values.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.tolerations }}
-      tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-  {{- if .Values.redis.persistence.enabled }}
-  volumeClaimTemplates:
-  - metadata:
-      name: redis-data
-    spec:
-      accessModes:
-        {{- range .Values.redis.persistence.accessModes }}
-        - {{ . | quote }}
-        {{- end }}
-      {{- if .Values.redis.persistence.storageClass }}
-      {{- if (eq "-" .Values.redis.persistence.storageClass) }}
-      storageClassName: ""
-      {{- else }}
-      storageClassName: {{ .Values.redis.persistence.storageClass | quote }}
-      {{- end }}
-      {{- else if .Values.global.storageClass }}
-      storageClassName: {{ .Values.global.storageClass | quote }}
-      {{- end }}
-      resources:
-        requests:
-          storage: {{ .Values.redis.persistence.size | quote }}
-  {{- end }}
-{{- end }}

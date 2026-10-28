@@ -1,56 +1,300 @@
+{{- $fullname := include "redis-sentinel.fullname" . }}
+{{- /* down-after twice plus election and promotion time */}}
+{{- $failoverWait := add (mul (div (int .Values.sentinel.downAfterMilliseconds) 1000) 2) 10 }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "redis-sentinel.fullname" . }}-redis-config
+  name: {{ $fullname }}-redis-config
   labels:
     {{- include "redis-sentinel.labels" . | nindent 4 }}
 data:
   redis.conf: |
     {{- .Values.redis.configuration | nindent 4 }}
-    {{- if .Values.redis.auth.enabled }}
-    {{- if .Values.redis.auth.acl.enabled }}
+    dir /data
+    {{- if and .Values.redis.auth.enabled .Values.redis.auth.acl.enabled }}
     # default user password is defined in acl.conf (requirepass is ignored when aclfile is set)
-    aclfile /opt/redis/acl.conf
-    {{- else }}
-    requirepass {{ .Values.redis.auth.password }}
+    aclfile /opt/redis-acl/acl.conf
     {{- end }}
-    # required by replicas, and by the master after it is demoted by a failover
-    masterauth {{ .Values.redis.auth.password }}
-    {{- end }}
-  {{- if and .Values.redis.auth.enabled .Values.redis.auth.acl.enabled }}
-  acl.conf: |
-    user default on >{{ .Values.redis.auth.password }} ~* &* +@all
-    {{- range .Values.redis.auth.acl.users }}
-    {{- if eq .username "default" }}
-    {{- fail "redis.auth.acl.users must not contain \"default\"; its password is redis.auth.password" }}
-    {{- end }}
-    user {{ .username }} on >{{ .password }} {{- with .keys }} {{ . }}{{ end }}{{- with .channels }} {{ . }}{{ end }} {{ .permissions }}
-    {{- end }}
-  {{- end }}
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "redis-sentinel.fullname" . }}-sentinel-config
+  name: {{ $fullname }}-sentinel-config
   labels:
     {{- include "redis-sentinel.labels" . | nindent 4 }}
 data:
-  sentinel.conf: |
-    # Basic sentinel configuration
-    port 26379
-
-    # Monitor the master - using service name that resolves to cluster IP
-    sentinel resolve-hostnames yes
-    sentinel monitor mymaster {{ include "redis-sentinel.masterHost" . }} 6379 2
-    sentinel down-after-milliseconds mymaster 5000
-    sentinel parallel-syncs mymaster 1
-    sentinel failover-timeout mymaster 10000
-
-    {{- if .Values.redis.auth.enabled }}
-    sentinel auth-pass mymaster {{ .Values.redis.auth.password }}
-    {{- end }}
-
-    # Additional configuration from values
-    {{- if .Values.sentinel.configuration }}
+  extra.conf: |
     {{- .Values.sentinel.configuration | nindent 4 }}
-    {{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-scripts
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+data:
+  common.sh: |
+    # Shared helpers. REDISCLI_AUTH (from the Secret) is used by redis-cli for Redis pods.
+
+    redis_host() {
+      echo "${REDIS_SERVICE}-$1.${REDIS_SERVICE}.${NAMESPACE}.svc.${CLUSTER_DOMAIN}"
+    }
+
+    resolve() {
+      nslookup "$1" 2>/dev/null | awk '/^Name:/ {f=1} f && /^Address/ {print $NF; exit}'
+    }
+
+    # Sentinel may report a master by IP; map it back to the pod hostname when possible
+    to_redis_host() {
+      case "$1" in
+        *[a-z]*) echo "$1"; return ;;
+      esac
+      i=0
+      while [ "$i" -lt "$REDIS_REPLICAS" ]; do
+        h=$(redis_host "$i")
+        if [ "$(resolve "$h")" = "$1" ]; then
+          echo "$h"
+          return
+        fi
+        i=$((i + 1))
+      done
+      echo "$1"
+    }
+
+    redis_role() {
+      timeout 3 redis-cli -h "$1" -p 6379 role 2>/dev/null | head -1
+    }
+
+    sentinel_master() {
+      env -u REDISCLI_AUTH timeout 3 redis-cli -h "$1" -p "$2" \
+        sentinel get-master-addr-by-name "$MASTER_SET" 2>/dev/null | head -1
+    }
+
+    # Prints the hostname of a Redis pod (other than $1) that currently reports role master
+    find_running_master() {
+      i=0
+      while [ "$i" -lt "$REDIS_REPLICAS" ]; do
+        h=$(redis_host "$i")
+        if [ "$h" != "$1" ] && [ "$(redis_role "$h")" = "master" ]; then
+          echo "$h"
+          return
+        fi
+        i=$((i + 1))
+      done
+    }
+
+  init-redis.sh: |
+    #!/bin/sh
+    set -eu
+    . /opt/scripts/common.sh
+
+    CONF=/data/redis.conf
+    MY_HOST=$(redis_host "${HOSTNAME##*-}")
+
+    cp /opt/redis-readonly/redis.conf "$CONF"
+    chmod 600 "$CONF"
+    {
+      echo "replica-announce-ip $MY_HOST"
+      if [ -n "${REDISCLI_AUTH:-}" ]; then
+        echo "masterauth \"$REDISCLI_AUTH\""
+        {{- if not .Values.redis.auth.acl.enabled }}
+        echo "requirepass \"$REDISCLI_AUTH\""
+        {{- end }}
+      fi
+    } >> "$CONF"
+
+    # Sentinel is the source of truth for the current master; follow it when it answers
+    # so a restarted former master never comes back as a second master.
+    MASTER=$(sentinel_master "$SENTINEL_SERVICE" "$SENTINEL_SERVICE_PORT")
+    if [ -n "$MASTER" ]; then
+      MASTER=$(to_redis_host "$MASTER")
+      echo "Sentinel reports master: $MASTER"
+      # Sentinel still names this pod although it just restarted, i.e. it has not noticed yet.
+      # Give it time to promote a replica instead of coming back as a second master next to it;
+      # start as master only when no failover happens (no usable replica, whole-cluster restart).
+      if { [ "$MASTER" = "$MY_HOST" ] || [ "$MASTER" = "${POD_IP:-}" ]; } && [ "$REDIS_REPLICAS" -gt 1 ]; then
+        echo "Waiting up to {{ $failoverWait }}s for Sentinel to fail over"
+        END=$(( $(date +%s) + {{ $failoverWait }} ))
+        while [ "$(date +%s)" -lt "$END" ]; do
+          OTHER=$(find_running_master "$MY_HOST")
+          [ -z "$OTHER" ] || break
+          sleep 1
+        done
+        if [ -n "$OTHER" ]; then
+          MASTER=$OTHER
+          echo "Sentinel promoted $MASTER"
+        fi
+      fi
+    else
+      MASTER=$(find_running_master "$MY_HOST")
+      if [ -n "$MASTER" ]; then
+        echo "Sentinel unavailable, found running master: $MASTER"
+      elif [ "${HOSTNAME##*-}" = "0" ]; then
+        MASTER=$MY_HOST
+        echo "Sentinel unavailable and no running master, bootstrapping as master"
+      else
+        MASTER=$(redis_host 0)
+        echo "Sentinel unavailable and no running master, following bootstrap master: $MASTER"
+      fi
+    fi
+
+    if [ "$MASTER" = "$MY_HOST" ] || [ "$MASTER" = "${POD_IP:-}" ]; then
+      echo "Starting as master"
+    else
+      echo "Starting as replica of $MASTER"
+      echo "replicaof $MASTER 6379" >> "$CONF"
+    fi
+
+  check-sync.sh: |
+    #!/bin/sh
+    # Startup check: a replica has started once its initial sync is done. When its master is
+    # not a reachable master there is nothing to wait for; the pod must become ready anyway,
+    # since its DNS name (and so Sentinel's view of it) only exists for ready pods.
+    . /opt/scripts/common.sh
+    INFO=$(redis-cli info replication 2>/dev/null | tr -d '\r')
+    echo "$INFO" | grep -qE '^role:master|^master_link_status:up' && exit 0
+    echo "$INFO" | grep -q '^role:slave' || exit 1
+    [ "$(redis_role "$(echo "$INFO" | awk -F: '/^master_host:/ {print $2}')")" != "master" ]
+
+  prestop-redis.sh: |
+    #!/bin/sh
+    # Hand the master role over before this pod stops, so clients see a short controlled switch
+    # instead of waiting for Sentinel's down-after timeout and an unplanned failover.
+    . /opt/scripts/common.sh
+    # preStop output is not kept by Kubernetes; send it to the container log
+    exec >/proc/1/fd/1 2>&1
+
+    TIMEOUT={{ .Values.redis.preStopFailoverTimeout }}
+    MY_HOST=$(redis_host "${HOSTNAME##*-}")
+
+    [ "$(redis_role localhost)" = "master" ] || exit 0
+    [ "$REDIS_REPLICAS" -gt 1 ] || exit 0
+
+    echo "preStop: master is stopping, asking Sentinel for a failover"
+    if ! env -u REDISCLI_AUTH timeout 3 redis-cli -h "$SENTINEL_SERVICE" -p "$SENTINEL_SERVICE_PORT" \
+        sentinel failover "$MASTER_SET" | grep -q OK; then
+      echo "preStop: Sentinel refused the failover"
+      exit 0
+    fi
+    # Block writes until this pod follows the promoted replica, so nothing is acknowledged here
+    # after the switch. Pausing only now keeps Sentinel's hello PUBLISHes from blocking earlier.
+    redis-cli client pause $((TIMEOUT * 1000)) write >/dev/null
+
+    # Follow the promoted replica right away instead of waiting for Sentinel to reconfigure this pod
+    i=0
+    while [ "$i" -lt "$TIMEOUT" ]; do
+      NEW=$(find_running_master "$MY_HOST")
+      if [ -n "$NEW" ]; then
+        echo "preStop: following new master $NEW"
+        redis-cli replicaof "$NEW" 6379 >/dev/null
+        break
+      fi
+      sleep 1
+      i=$((i + 1))
+    done
+    redis-cli client unpause >/dev/null
+
+  init-sentinel.sh: |
+    #!/bin/sh
+    set -eu
+    . /opt/scripts/common.sh
+
+    CONF=/data/sentinel.conf
+    MY_HOST="${HOSTNAME}.${SENTINEL_SERVICE}.${NAMESPACE}.svc.${CLUSTER_DOMAIN}"
+
+    # Learn the current master from a peer Sentinel, then from the Redis pods themselves,
+    # and only fall back to the bootstrap master (pod 0) on a fresh install.
+    MASTER=""
+    PEER_MASTER=""
+    i=0
+    while [ "$i" -lt "$SENTINEL_REPLICAS" ] && [ -z "$MASTER" ]; do
+      peer="${SENTINEL_SERVICE}-$i.${SENTINEL_SERVICE}.${NAMESPACE}.svc.${CLUSTER_DOMAIN}"
+      if [ "$peer" != "$MY_HOST" ]; then
+        candidate=$(sentinel_master "$peer" 26379)
+        if [ -n "$candidate" ]; then
+          candidate=$(to_redis_host "$candidate")
+          if [ "$(redis_role "$candidate")" = "master" ]; then
+            MASTER=$candidate
+            echo "Peer $peer reports master: $MASTER"
+          elif [ -z "$PEER_MASTER" ]; then
+            PEER_MASTER=$candidate
+          fi
+        fi
+      fi
+      i=$((i + 1))
+    done
+    if [ -z "$MASTER" ]; then
+      MASTER=$(find_running_master "")
+      [ -n "$MASTER" ] && echo "Found running master: $MASTER"
+    fi
+    # A peer's answer we could not verify (e.g. the master is restarting) still beats the bootstrap guess
+    if [ -z "$MASTER" ] && [ -n "$PEER_MASTER" ]; then
+      MASTER=$PEER_MASTER
+      echo "Peer reports master (not reachable yet): $MASTER"
+    fi
+    if [ -z "$MASTER" ]; then
+      MASTER=$(redis_host 0)
+      echo "No master found, using bootstrap master: $MASTER"
+    fi
+
+    cat > "$CONF" <<EOF
+    port 26379
+    sentinel resolve-hostnames yes
+    sentinel announce-hostnames yes
+    sentinel announce-ip $MY_HOST
+    sentinel deny-scripts-reconfig yes
+    sentinel monitor $MASTER_SET $MASTER 6379 {{ .Values.sentinel.quorum }}
+    sentinel down-after-milliseconds $MASTER_SET {{ .Values.sentinel.downAfterMilliseconds }}
+    sentinel parallel-syncs $MASTER_SET {{ .Values.sentinel.parallelSyncs }}
+    sentinel failover-timeout $MASTER_SET {{ .Values.sentinel.failoverTimeout }}
+    EOF
+    # List every other Redis pod as a replica, so Sentinel can fail over even if it never
+    # reaches the master (e.g. all Sentinels restarted while the master was down)
+    i=0
+    while [ "$i" -lt "$REDIS_REPLICAS" ]; do
+      h=$(redis_host "$i")
+      [ "$h" != "$MASTER" ] && echo "sentinel known-replica $MASTER_SET $h 6379" >> "$CONF"
+      i=$((i + 1))
+    done
+    if [ -n "${REDISCLI_AUTH:-}" ]; then
+      echo "sentinel auth-pass $MASTER_SET \"$REDISCLI_AUTH\"" >> "$CONF"
+    fi
+    cat /opt/sentinel-readonly/extra.conf >> "$CONF"
+    chmod 600 "$CONF"
+
+  sentinel-cleanup.sh: |
+    #!/bin/sh
+    # Sentinel never forgets an instance it has seen. Entries addressed by IP (from a chart version
+    # that did not announce hostnames) stay around as duplicates of the hostname entries; they count
+    # towards the failover majority and, once the IP is reused, can make Sentinel reconfigure the
+    # wrong pod. Reset the master set once every pod is healthy under its hostname.
+    sentinel() {
+      env -u REDISCLI_AUTH timeout 3 redis-cli -p 26379 sentinel "$@" 2>/dev/null
+    }
+
+    # redis-cli prints each entry as alternating key/value lines; prints "<ip> <flags>" per entry
+    entries() {
+      awk 'NR % 2 == 1 { key = $0; next } key == "ip" { ip = $0 } key == "flags" { print ip, $0 }'
+    }
+    by_ip() {
+      echo "$1" | grep -qE '^[0-9.]+$|:'
+    }
+
+    while sleep {{ .Values.sentinel.cleanupInterval }}; do
+      set -- $(sentinel master "$MASTER_SET" | entries)
+      [ "${2:-}" = "master" ] && ! by_ip "$1" || continue
+
+      stale=0
+      healthy=0
+      for e in $( { sentinel replicas "$MASTER_SET"; sentinel sentinels "$MASTER_SET"; } | entries | tr ' ' '|'); do
+        if by_ip "${e%|*}"; then
+          stale=1
+        elif [ "${e#*|}" = "slave" ] || [ "${e#*|}" = "sentinel" ]; then
+          healthy=$((healthy + 1))
+        fi
+      done
+      if [ "$stale" = 1 ] && [ "$healthy" -eq $((REDIS_REPLICAS - 1 + SENTINEL_REPLICAS - 1)) ]; then
+        echo "$(date) Removing IP-addressed entries: sentinel reset $MASTER_SET"
+        sentinel reset "$MASTER_SET" >/dev/null
+      fi
+    done
